@@ -1,13 +1,12 @@
-import { defineConfig } from "vite";
-import { tanstackStart } from "@tanstack/react-start/plugin/vite";
-import netlify from "@netlify/vite-plugin-tanstack-start";
+
+import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
-plugins: [
-tanstackStart({
-// Keep your existing server entry configuration.
-server: { entry: "server" },
-}),
-netlify(),
-],
+  nitro: {
+    preset: "netlify",
+  },
+  tanstackStart: {
+    server: { entry: "server" },
+  },
 });
+
