@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { supabase } from '@/integrations/supabase/client';
 
 export const Route = createFileRoute('/_authenticated/love-reasons')({
   ssr: false,
@@ -121,39 +122,205 @@ function LoveReasonsPage() {
   const [favorites, setFavorites] = useState<number[]>([]);
   const [showFavorites, setShowFavorites] = useState(false);
 
+  const [ready, setReady] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('Loading your memories...');
+  const userIdRef = useRef<string | null>(null);
+  const initializedRef = useRef(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const OPENED_KEY = 'our-little-world-love-reasons-opened';
+  const FAVORITES_KEY = 'our-little-world-love-reasons-favorites';
+
+  // Load browser progress, then restore cloud progress or migrate local progress.
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem('our-little-world-love-reasons-opened');
-      if (saved) setOpened(JSON.parse(saved));
-    } catch {
-      // Keep the page usable if browser storage is unavailable.
+    let cancelled = false;
+
+    async function loadProgress() {
+      let localOpened: number[] = [];
+      let localFavorites: number[] = [];
+
+      try {
+        const savedOpened = localStorage.getItem(OPENED_KEY);
+        const savedFavorites = localStorage.getItem(FAVORITES_KEY);
+
+        if (savedOpened) {
+          const parsed: unknown = JSON.parse(savedOpened);
+          if (Array.isArray(parsed)) {
+            localOpened = parsed.filter(
+              (value): value is number =>
+                Number.isInteger(value) && value >= 0 && value < reasons.length
+            );
+          }
+        }
+
+        if (savedFavorites) {
+          const parsed: unknown = JSON.parse(savedFavorites);
+          if (Array.isArray(parsed)) {
+            localFavorites = parsed.filter(
+              (value): value is number =>
+                Number.isInteger(value) && value >= 0 && value < reasons.length
+            );
+          }
+        }
+      } catch {
+        // Continue with empty local progress if browser storage is unavailable.
+      }
+
+      if (cancelled) return;
+
+      setOpened(localOpened);
+      setFavorites(localFavorites);
+
+      try {
+        const { data: authData, error: authError } = await supabase.auth.getUser();
+        if (authError) throw authError;
+
+        const user = authData.user;
+
+        if (user) {
+          userIdRef.current = user.id;
+
+          const { data, error } = await (supabase as any)
+            .from('love_site_progress')
+            .select('data')
+            .eq('user_id', user.id)
+            .eq('feature', 'love_reasons')
+            .maybeSingle();
+
+          if (error) throw error;
+          if (cancelled) return;
+
+          if (data?.data) {
+            const cloudOpened = Array.isArray(data.data.opened)
+              ? data.data.opened.filter(
+                  (value: unknown): value is number =>
+                    Number.isInteger(value) &&
+                    typeof value === 'number' &&
+                    value >= 0 &&
+                    value < reasons.length
+                )
+              : [];
+
+            const cloudFavorites = Array.isArray(data.data.favorites)
+              ? data.data.favorites.filter(
+                  (value: unknown): value is number =>
+                    Number.isInteger(value) &&
+                    typeof value === 'number' &&
+                    value >= 0 &&
+                    value < reasons.length
+                )
+              : [];
+
+            setOpened(cloudOpened);
+            setFavorites(cloudFavorites);
+
+            try {
+              localStorage.setItem(OPENED_KEY, JSON.stringify(cloudOpened));
+              localStorage.setItem(FAVORITES_KEY, JSON.stringify(cloudFavorites));
+            } catch {
+              // Cloud progress remains available.
+            }
+
+            setSyncStatus('Your love notes are synced 💗');
+          } else {
+            // Keep existing browser progress and migrate it if no cloud row exists.
+            const { error: saveError } = await (supabase as any)
+              .from('love_site_progress')
+              .upsert(
+                {
+                  user_id: user.id,
+                  feature: 'love_reasons',
+                  data: {
+                    opened: localOpened,
+                    favorites: localFavorites,
+                  },
+                  updated_at: new Date().toISOString(),
+                },
+                { onConflict: 'user_id,feature' }
+              );
+
+            if (saveError) throw saveError;
+            if (cancelled) return;
+
+            setSyncStatus('Your love notes are synced 💗');
+          }
+        } else {
+          setSyncStatus('Saved on this device');
+        }
+      } catch (error) {
+        console.error('Could not load love reasons progress:', error);
+        if (!cancelled) setSyncStatus('Using this device for now');
+      } finally {
+        if (!cancelled) {
+          initializedRef.current = true;
+          setReady(true);
+        }
+      }
     }
+
+    void loadProgress();
+
+    return () => {
+      cancelled = true;
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
   }, []);
 
+  // Keep local storage updated as a fallback.
   useEffect(() => {
+    if (!ready) return;
     try {
-      const savedFavorites = localStorage.getItem('our-little-world-love-reasons-favorites');
-      if (savedFavorites) setFavorites(JSON.parse(savedFavorites));
+      localStorage.setItem(OPENED_KEY, JSON.stringify(opened));
     } catch {
-      // Keep favorites usable for this visit if storage is unavailable.
+      // Progress remains available for this visit.
     }
-  }, []);
+  }, [opened, ready]);
 
   useEffect(() => {
+    if (!ready) return;
     try {
-      localStorage.setItem('our-little-world-love-reasons-favorites', JSON.stringify(favorites));
+      localStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites));
     } catch {
-      // Favorites still work for the current visit.
+      // Favorites remain available for this visit.
     }
-  }, [favorites]);
+  }, [favorites, ready]);
 
+  // Debounce cloud writes to avoid sending a request for every quick interaction.
   useEffect(() => {
-    try {
-      localStorage.setItem('our-little-world-love-reasons-opened', JSON.stringify(opened));
-    } catch {
-      // The opened cards still work for the current visit.
-    }
-  }, [opened]);
+    if (!ready || !initializedRef.current || !userIdRef.current) return;
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+
+    const userId = userIdRef.current;
+    saveTimerRef.current = setTimeout(() => {
+      void (async () => {
+        setSyncStatus('Saving your love notes...');
+        try {
+          const { error } = await (supabase as any)
+            .from('love_site_progress')
+            .upsert(
+              {
+                user_id: userId,
+                feature: 'love_reasons',
+                data: { opened, favorites },
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: 'user_id,feature' }
+            );
+
+          if (error) throw error;
+          setSyncStatus('Your love notes are synced 💗');
+        } catch (error) {
+          console.error('Could not save love reasons progress:', error);
+          setSyncStatus('Sync failed — your device copy is saved');
+        }
+      })();
+    }, 500);
+
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [opened, favorites, ready]);
 
   const visible = useMemo(() => {
     const all = reasons.map((_, i) => i);
@@ -217,7 +384,11 @@ function LoveReasonsPage() {
         <div className="lr-progress-wrap" aria-label={`${opened.length} of 100 reasons opened`}>
           <div className="lr-progress" style={{ width: `${opened.length}%` }} />
         </div>
-        <div className="lr-progress-label">{opened.length} of 100 little love notes discovered 💗</div>
+        <div className="lr-progress-label">
+          {opened.length} of {reasons.length} little love notes discovered 💗
+          <br />
+          <span>{syncStatus}</span>
+        </div>
 
         <div className="lr-toolbar">
           <button className="lr-btn primary" onClick={() => openReason(reasons.findIndex((_, i) => !opened.includes(i)) === -1 ? 0 : reasons.findIndex((_, i) => !opened.includes(i)))}>

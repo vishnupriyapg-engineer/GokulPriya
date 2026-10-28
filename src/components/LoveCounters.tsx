@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
 
 const STORAGE_KEY = "our-little-world-love-counters-v1";
 
@@ -16,7 +17,7 @@ const initialCounts: Counts = { love: 0, miss: 0, hug: 0, kiss: 0, annoy: 0 };
 function readCounts(): Counts {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (!saved) return initialCounts;
+    if (!saved) return { ...initialCounts };
     const parsed = JSON.parse(saved) as Partial<Counts>;
     return {
       love: Math.max(0, Number(parsed.love) || 0),
@@ -26,7 +27,7 @@ function readCounts(): Counts {
       annoy: Math.max(0, Number(parsed.annoy) || 0),
     };
   } catch {
-    return initialCounts;
+    return { ...initialCounts };
   }
 }
 
@@ -34,22 +35,118 @@ export default function LoveCounters() {
   const [counts, setCounts] = useState<Counts>(initialCounts);
   const [pressed, setPressed] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [syncMessage, setSyncMessage] = useState("");
+  const countsRef = useRef<Counts>(initialCounts);
+  const userIdRef = useRef<string | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+  const initialSyncDoneRef = useRef(false);
+
+  async function saveCounts(next: Counts, userId: string) {
+    const { error } = await (supabase as any)
+      .from("love_site_progress")
+      .upsert(
+        {
+          user_id: userId,
+          feature: "homepage_counts",
+          data: next,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,feature" },
+      );
+    if (error) throw error;
+  }
 
   useEffect(() => {
-    setCounts(readCounts());
-    setReady(true);
+    let cancelled = false;
+
+    async function loadCounts() {
+      const localCounts = readCounts();
+      countsRef.current = localCounts;
+      setCounts(localCounts);
+
+      try {
+        const { data: authData, error: authError } = await supabase.auth.getUser();
+        if (authError) throw authError;
+        if (!authData.user) {
+          if (!cancelled) {
+            setSyncMessage("Sign in to sync counters between devices.");
+            setReady(true);
+          }
+          return;
+        }
+
+        userIdRef.current = authData.user.id;
+        const { data, error } = await (supabase as any)
+          .from("love_site_progress")
+          .select("data")
+          .eq("user_id", authData.user.id)
+          .eq("feature", "homepage_counts")
+          .maybeSingle();
+
+        if (error) throw error;
+        if (cancelled) return;
+
+        if (data?.data && typeof data.data === "object") {
+          const cloud = data.data as Partial<Counts>;
+          const merged: Counts = {
+            love: Math.max(0, Number(cloud.love) || 0),
+            miss: Math.max(0, Number(cloud.miss) || 0),
+            hug: Math.max(0, Number(cloud.hug) || 0),
+            kiss: Math.max(0, Number(cloud.kiss) || 0),
+            annoy: Math.max(0, Number(cloud.annoy) || 0),
+          };
+          countsRef.current = merged;
+          setCounts(merged);
+          try { localStorage.setItem(STORAGE_KEY, JSON.stringify(merged)); } catch {}
+        } else {
+          // Preserve and migrate existing browser counts instead of starting at zero.
+          await saveCounts(localCounts, authData.user.id);
+        }
+
+        initialSyncDoneRef.current = true;
+        if (!cancelled) {
+          setSyncMessage("Saved and synced across devices 💗");
+          setReady(true);
+        }
+      } catch (error) {
+        console.error("Could not sync homepage counters:", error);
+        if (!cancelled) {
+          setSyncMessage("Cloud sync unavailable; your browser copy is kept.");
+          setReady(true);
+        }
+      }
+    }
+
+    void loadCounts();
+    return () => { cancelled = true; };
   }, []);
 
-  function increment(id: keyof Counts) {
-    setCounts((current) => {
-      const next = { ...current, [id]: current[id] + 1 };
+  useEffect(() => {
+    if (!ready || !initialSyncDoneRef.current) return;
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(counts)); } catch {}
+
+    if (!userIdRef.current) return;
+    if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(async () => {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      } catch {
-        // The current session still works if browser storage is unavailable.
+        await saveCounts(countsRef.current, userIdRef.current!);
+        setSyncMessage("Saved and synced across devices 💗");
+      } catch (error) {
+        console.error("Could not save homepage counters:", error);
+        setSyncMessage("Couldn't sync right now; your browser copy is kept.");
       }
-      return next;
-    });
+    }, 350);
+
+    return () => {
+      if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+    };
+  }, [counts, ready]);
+
+  function increment(id: keyof Counts) {
+    const next = { ...countsRef.current, [id]: countsRef.current[id] + 1 };
+    countsRef.current = next;
+    setCounts(next);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
     setPressed(id);
     window.setTimeout(() => setPressed((current) => current === id ? null : current), 650);
   }
@@ -71,7 +168,7 @@ export default function LoveCounters() {
       <header className="lc-heading">
         <div className="lc-kicker">little feelings, big numbers ♡</div>
         <h2 id="love-counter-title" className="lc-title">A Million Little Ways to Love You</h2>
-        <p className="lc-subtitle">Tap a button whenever you feel it. Every tap adds one more to our little forever counter. These numbers stay saved on this browser—there's no reset button. 💌</p>
+        <p className="lc-subtitle">Tap a button whenever you feel it. Every tap adds one more to our little forever counter. Every tap is saved to our shared little cloud, so the numbers can follow us across devices. 💌</p>
       </header>
       <div className="lc-grid">
         {actions.map((action) => (
@@ -85,6 +182,7 @@ export default function LoveCounters() {
         ))}
       </div>
       <p className="lc-foot">Every tap is a tiny reminder: you're loved. Always. ♡</p>
+      <p role="status" aria-live="polite" style={{ textAlign: "center", marginTop: 10, fontSize: 12, color: "#946779" }}>{syncMessage}</p>
     </section>
   );
 }

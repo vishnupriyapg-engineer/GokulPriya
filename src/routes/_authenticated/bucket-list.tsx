@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { supabase } from "@/integrations/supabase/client";
 
 export const Route = createFileRoute("/_authenticated/bucket-list")({
   ssr: false,
@@ -18,6 +19,7 @@ type Dream = {
 };
 
 const STORAGE_KEY = "our-little-world-bucket-list-v2";
+const CLOUD_FEATURE = "bucket_list";
 
 const starterDreams: Dream[] = [
   { id: "romance-90", title: "Walpaper photo", description: "Unthu enthu wallpaper la nama 2 per iruka favourite photo vechukanum🥹❤️", category: "Romance", emoji: "👕" },
@@ -88,6 +90,11 @@ function BucketListPage() {
   const [newCategory, setNewCategory] = useState<Category>("Romance");
   const [showAddDream, setShowAddDream] = useState(false);
   const [notice, setNotice] = useState("");
+  const [syncStatus, setSyncStatus] = useState("Loading your dreams…");
+  const [cloudReady, setCloudReady] = useState(false);
+  const userIdRef = useRef<string | null>(null);
+  const cloudLoadStartedRef = useRef(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     try {
@@ -127,6 +134,94 @@ function BucketListPage() {
     }
   }, []);
 
+  // Load this user's cloud progress after local data has been restored.
+  // If the cloud row does not exist yet, migrate the current local collection.
+  useEffect(() => {
+    if (!loaded || cloudLoadStartedRef.current) return;
+    cloudLoadStartedRef.current = true;
+    let cancelled = false;
+
+    async function loadCloudProgress() {
+      try {
+        const { data: authData, error: authError } = await supabase.auth.getUser();
+        if (authError) throw authError;
+        const user = authData.user;
+
+        if (!user) {
+          if (!cancelled) {
+            setSyncStatus("Saved on this device");
+            setCloudReady(false);
+          }
+          return;
+        }
+
+        userIdRef.current = user.id;
+        const { data, error } = await (supabase as any)
+          .from("love_site_progress")
+          .select("data")
+          .eq("user_id", user.id)
+          .eq("feature", CLOUD_FEATURE)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (cancelled) return;
+
+        if (data?.data && typeof data.data === "object") {
+          const cloudValue = data.data as { dreams?: unknown; completedIds?: unknown };
+          if (Array.isArray(cloudValue.dreams)) {
+            const validCloudDreams = cloudValue.dreams.filter((item): item is Dream =>
+              typeof item === "object" && item !== null &&
+              typeof (item as Dream).id === "string" &&
+              typeof (item as Dream).title === "string" &&
+              typeof (item as Dream).description === "string" &&
+              typeof (item as Dream).category === "string" &&
+              typeof (item as Dream).emoji === "string"
+            );
+            const starterIds = new Set(starterDreams.map((dream) => dream.id));
+            const cloudCustomDreams = validCloudDreams.filter((dream) => !starterIds.has(dream.id));
+            setDreams([...starterDreams, ...cloudCustomDreams]);
+          }
+          if (Array.isArray(cloudValue.completedIds)) {
+            setCompletedIds(cloudValue.completedIds.filter((id): id is string => typeof id === "string"));
+          }
+          setSyncStatus("Synced across your devices ♡");
+        } else {
+          const localRaw = window.localStorage.getItem(STORAGE_KEY);
+          const localValue = localRaw ? JSON.parse(localRaw) as { dreams?: Dream[]; completedIds?: string[] } : null;
+          const starterIds = new Set(starterDreams.map((dream) => dream.id));
+          const localDreams = Array.isArray(localValue?.dreams) ? localValue.dreams : dreams;
+          const customDreams = localDreams.filter((dream) => !starterIds.has(dream.id));
+          const migratedDreams = [...starterDreams, ...customDreams];
+          const migratedCompleted = Array.isArray(localValue?.completedIds) ? localValue.completedIds : completedIds;
+          const { error: saveError } = await (supabase as any)
+            .from("love_site_progress")
+            .upsert({
+              user_id: user.id,
+              feature: CLOUD_FEATURE,
+              data: { dreams: migratedDreams, completedIds: migratedCompleted },
+              updated_at: new Date().toISOString(),
+            }, { onConflict: "user_id,feature" });
+          if (saveError) throw saveError;
+          if (cancelled) return;
+          setDreams(migratedDreams);
+          setCompletedIds(migratedCompleted);
+          setSyncStatus("Synced across your devices ♡");
+        }
+
+        if (!cancelled) setCloudReady(true);
+      } catch (error) {
+        console.error("Bucket list cloud sync failed:", error);
+        if (!cancelled) {
+          setSyncStatus("Cloud sync unavailable · saved on this device");
+          setCloudReady(false);
+        }
+      }
+    }
+
+    void loadCloudProgress();
+    return () => { cancelled = true; };
+  }, [loaded]);
+
   useEffect(() => {
     if (!loaded) return;
     try {
@@ -135,6 +230,34 @@ function BucketListPage() {
       // The experience remains usable for the current visit without storage.
     }
   }, [dreams, completedIds, loaded]);
+
+  // Debounce updates so every small UI action does not create a separate request.
+  useEffect(() => {
+    if (!cloudReady || !userIdRef.current) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      const userId = userIdRef.current;
+      if (!userId) return;
+      try {
+        const { error } = await (supabase as any)
+          .from("love_site_progress")
+          .upsert({
+            user_id: userId,
+            feature: CLOUD_FEATURE,
+            data: { dreams, completedIds },
+            updated_at: new Date().toISOString(),
+          }, { onConflict: "user_id,feature" });
+        if (error) throw error;
+        setSyncStatus("Synced across your devices ♡");
+      } catch (error) {
+        console.error("Bucket list cloud save failed:", error);
+        setSyncStatus("Cloud save failed · check your connection");
+      }
+    }, 650);
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [dreams, completedIds, cloudReady]);
 
   useEffect(() => {
     if (!notice) return;
@@ -486,7 +609,10 @@ function BucketListPage() {
               <div className="jar-progress-fill" style={{ width: `${progress}%` }} />
             </div>
           </div>
-          <div className="jar-progress-count">{completedDreams.length} / {dreams.length} achieved · {progress}%</div>
+          <div className="jar-progress-count">
+            {completedDreams.length} / {dreams.length} achieved · {progress}%
+            <br /><span style={{ display: "inline-block", marginTop: 6, fontSize: 10, letterSpacing: 0, textTransform: "none" }}>{syncStatus}</span>
+          </div>
         </section>
 
         <section className="jar-pair" aria-label="Our two dream jars">
