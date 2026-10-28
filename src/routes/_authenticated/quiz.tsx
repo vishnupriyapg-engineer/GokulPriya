@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
+import { supabase } from '@/integrations/supabase/client';
 
 export const Route = createFileRoute('/_authenticated/quiz')({ ssr: false, component: LoveQuestPage });
 
@@ -549,6 +550,9 @@ function LoveQuestPage() {
     if (typeof window === 'undefined') return {};
     try { return JSON.parse(window.localStorage.getItem('our-little-world-love-quest-answers') ?? '{}') as Record<string, string>; } catch { return {}; }
   });
+  // Wait for the account's database answers to load before syncing anything.
+  const [answersLoaded, setAnswersLoaded] = useState(false);
+  const [supabaseUserId, setSupabaseUserId] = useState<string | null>(null);
   const [editingOpen, setEditingOpen] = useState(false);
   const [written, setWritten] = useState('');
   const [ratingDraft, setRatingDraft] = useState(8);
@@ -570,7 +574,85 @@ const roundOneQuestions = rounds[0]?.questions ?? [];
   const showRoundOneScore = roundIndex === 0 && isLastQuestionOfRound && roundOneAnswered === roundOneQuestions.length;
 
   useEffect(() => { document.title = 'Love Quest · Our Little World'; }, []);
-  useEffect(() => { try { window.localStorage.setItem('our-little-world-love-quest-answers', JSON.stringify(answers)); } catch { /* Keep the quiz usable when storage is unavailable. */ } }, [answers]);
+
+  // Load the shared answers for the currently signed-in Supabase account.
+  // If this account has no database record yet, migrate any existing local answers once.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadSharedAnswers() {
+      try {
+        const { data: userResult, error: userError } = await supabase.auth.getUser();
+        if (userError) throw userError;
+        const user = userResult.user;
+
+        if (cancelled) return;
+        if (!user) {
+          // The quiz remains usable locally if there is no active Supabase session.
+          setAnswersLoaded(true);
+          return;
+        }
+
+        setSupabaseUserId(user.id);
+        const { data, error } = await (supabase as any)
+          .from('love_quest_answers')
+          .select('answers')
+          .eq('user_id', user.id)
+          .maybeSingle();
+        if (error) throw error;
+        if (cancelled) return;
+
+        const saved = data?.answers;
+        if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+          setAnswers(saved as Record<string, string>);
+        } else {
+          let localAnswers: Record<string, string> = {};
+          try {
+            const parsed: unknown = JSON.parse(window.localStorage.getItem('our-little-world-love-quest-answers') ?? '{}');
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              localAnswers = parsed as Record<string, string>;
+            }
+          } catch { /* Ignore invalid local data. */ }
+
+          if (Object.keys(localAnswers).length > 0) {
+            const { error: migrationError } = await (supabase as any)
+              .from('love_quest_answers')
+              .upsert({ user_id: user.id, answers: localAnswers, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+            if (migrationError) throw migrationError;
+            setAnswers(localAnswers);
+          }
+        }
+
+        setAnswersLoaded(true);
+      } catch (error) {
+        console.error('[Love Quest] Could not load shared answers from Supabase:', error);
+        // Do not enable database writes after a failed load; this prevents empty local
+        // state from overwriting answers already saved in the database.
+      }
+    }
+
+    void loadSharedAnswers();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Keep local storage as a quick local cache, and sync changes to the shared database.
+  useEffect(() => {
+    try { window.localStorage.setItem('our-little-world-love-quest-answers', JSON.stringify(answers)); } catch { /* Keep the quiz usable when storage is unavailable. */ }
+  }, [answers]);
+
+  useEffect(() => {
+    if (!answersLoaded || !supabaseUserId) return;
+    const timer = window.setTimeout(() => {
+      void (supabase as any)
+        .from('love_quest_answers')
+        .upsert({ user_id: supabaseUserId, answers, updated_at: new Date().toISOString() }, { onConflict: 'user_id' })
+        .then(({ error }: { error: unknown }) => {
+          if (error) console.error('[Love Quest] Could not save shared answers to Supabase:', error);
+        });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [answers, answersLoaded, supabaseUserId]);
+
   useEffect(() => {
     setWritten(answer);
     setEditingOpen(question.kind === 'open' && !answer);
